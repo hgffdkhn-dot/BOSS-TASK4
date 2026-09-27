@@ -56,7 +56,20 @@ make static                   # 静态 PIE 产物 build/boss-static
 ```bash
 bash build/build-ndk.sh                  # -> dist/boss-android-{arm64,arm,x86_64,x86}
 MAKE_PAYLOAD=1 bash build/build-ndk.sh   # 顺带生成 build/payload/ 与 dist/boss-payload.zip
+WITH_SEPOL=1 bash build/build-ndk.sh     # 内置 libsepol（早期注入需要，先跑 vendor-sepol.sh）
 ```
+
+> ⚠️ 这个脚本在 `build/` 下，而 `build/` 同时是构建产物目录。
+> **别把 `build/` 整目录写进 `.gitignore`**——脚本会永远提交不上去，
+> CI 第一步 `bash build/build-ndk.sh` 就 `No such file or directory`，
+> 而本地一直是绿的（本地工作区里那个文件好端端躺着）。
+> 这个坑真实发生过。现在的处理是 `build/*` + `!build/build-ndk.sh`。
+
+`build-ndk.sh` 不赌某一个链接标志组合：`-static -fPIE -pie` 并**不会**得到
+静态 PIE（链接器见到 `-static` 就关掉 PIE，产出 `ET_EXEC`）。它按候选顺序试
+`-static-pie` → `-static -fPIE -pie` → `-static -fPIE -pie -Wl,-pie` → `-fPIE -pie`，
+每个候选都先 `tools/elf_fix.py` 修 PT_TLS 对齐再 `--check` 验收，取第一个产出
+`ET_DYN` 的。编译通过 ≠ 上机能跑，这道校验不能删。
 
 ## 注入（真机）
 

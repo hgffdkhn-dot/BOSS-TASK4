@@ -179,7 +179,24 @@ make 看不出 target-specific 的 `EXTRA_CFLAGS` 变了——只要产物存在
 产物名变了的话记得同步脚本里的 `pkill -x <名字>`，否则残留 daemon 会占住抽象套接字，
 下一次跑就是 `listen failed: Address already in use`（表现为日志项莫名失败）。
 
-#### 3.3.5 体积代价（真机上线前必须确认）
+#### 3.3.5 要不要把内置后端编进 ramdisk 里的那个 boss（未定，需真机确认）
+
+`payload/manifest.json` 只往 ramdisk 里放**一个** `boss`，而早期注入用的就是这个
+二进制。所以"路径 A 能不能成立"最终取决于**编 payload 时有没有带 sepol**：
+
+```bash
+bash tools/vendor-sepol.sh
+WITH_SEPOL=1 MAKE_PAYLOAD=1 bash build/build-ndk.sh
+```
+
+默认**不带**（`WITH_SEPOL=0`）：ramdisk 体积是硬约束（8.3），多 224KB 可能就放不进
+init_boot 分区。不带的话路径 A 退化成"规则进 pending，等 /data 挂载后由路径 B 兜底"——
+功能不残，但早期注入那段就不生效了。
+
+**这个选择必须在真机上量过分区剩余空间再定**，沙盒里定不了。两种都留了口子，
+且都能用同一个 `boss_selinux=0` 开关现场退回原厂路径。
+
+#### 3.3.6 体积代价（真机上线前必须确认）
 
 内置 libsepol 会让二进制变大（主机侧实测 **+224KB**：128KB → 352KB）。
 ramdisk 体积是硬约束（接力须知 8.3）。上真机前确认 boot / init_boot 分区放得下；
@@ -468,4 +485,5 @@ src/bossinit.c                早期注入的接线（cmd_stage2 接 selinux_set
 tests/sepolkit.c              造最小 kernel policy 靶子（仅测试用，不进主构建）
 tools/sepol_backend_test.sh   内置后端 25 项验收
 tools/stage2_test.sh          init stage2 接线 6 项验收（含"绝不 exec 自己"的兜底）
+build/build-ndk.sh            Android 四 ABI 交叉编译 + Bionic 加载校验（CI 的 android job 用）
 ```

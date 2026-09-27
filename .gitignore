@@ -1,0 +1,13 @@
+# 构建产物
+dist/
+build/*
+!build/build-ndk.sh
+
+# ⚠️ 别把 build/ 整个目录写进来。
+# build/ 既是构建产物目录，也是 build-ndk.sh 的家。整目录忽略的后果是
+# 脚本永远提交不上去——CI 的 android job 第一步就 `bash build/build-ndk.sh`，
+# 于是稳定报 "No such file or directory"，而本地怎么跑都是绿的，
+# 因为本地工作区里那个文件一直躺在那儿。这个坑真实发生过。
+# 所以这里用 build/* + 反向声明，只忽略产物、保住脚本。
+
+# 本地 vendor 的第三方源码不忽略（external/libsepol 是要随仓库走的）
