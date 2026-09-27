@@ -284,8 +284,20 @@ static int cmd_hijack_prep(void)
         int fd = open("/sdcard", O_CREAT | O_RDONLY | O_CLOEXEC, 0700);
         if (fd >= 0) close(fd);
     }
-    /* 真正的 bind mount 由第一阶段的 bossinit 完成（见 docs）：
-     *   mount --bind <bossinit> /sdcard
+    /* ⚠️ 缺关键一步：这里的 bind mount 还没做。
+     *
+     *   mount(<bossinit 自身路径>, "/sdcard", NULL, MS_BIND, NULL);
+     *
+     * 没有这一次 mount，切根后 /system/bin/init 仍然是原厂 init，
+     * BOSS 根本不会被当成第二阶段 init 调起 —— 于是 cmd_stage2（含任务4
+     * 接好的 selinux_setup 早期注入）在 2SI 设备上一次都不会执行。
+     *
+     * 补的时候注意两点：
+     *   · 直接调 mount(2)，别 fork /system/bin/mount —— 第一阶段没有 toolbox。
+     *   · 还缺 /init.real 备份（真实 init 必须在切根**之前**备份好），
+     *     没有它 cmd_stage2 走到 execv 前就返回 127。
+     *
+     * 详见 docs/HANDOFF-接力须知.md 的 5.1.1（接手后第一件事）。
      * 这里只负责把符号链接铺好。 */
     return 0;
 }

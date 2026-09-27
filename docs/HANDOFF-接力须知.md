@@ -16,7 +16,10 @@
 | payload（veritpath 用） | ✅ 已实测注入 | `payload-check` / `inject` / `verify` 全过 |
 | CI / Release | ✅ 已配好 | 见第 8 节 |
 | **2SI 设备自动拉起** | ❌ **没做** | v0.2 的 init 接管，见第 5 节。**这是当前最大缺口** |
-| SELinux 正式策略 | ❌ 没做 | 依赖任务 4，接口已收敛在一个函数 |
+| ↳ `cmd_hijack_prep` | ⚠️ **做了一半** | 符号链接铺好了，**bind mount 没做**（`bossinit.c` 里没有 `mount()` 调用）。缺它 BOSS 就不会被调起 —— 见 5.1.1，接手后第一件事 |
+| ↳ `cmd_stage2` | ✅ 任务4 已接好 | `selinux_setup` 分支 + 早期注入 + 阶段参数转发都就绪。**但要先能被调起才有用** |
+| ↳ `/init.real` 备份 | ❌ **没做** | stage2 依赖真实 init 已备份到 `/init.real`，没人做；没它直接返回 127 |
+| SELinux 正式策略 | ✅ 任务4 已交付 | 255 条规则 + 引擎（含内置 libsepol）+ 打标签，见 `docs/TASK4`。**未上真机** |
 | BOSS 前端授权 | ❌ 没做 | 依赖任务 6，接口是 `policy_decide()` |
 
 **一句话**：su 的"内核与用户态链路"已经闭环，但它在 Android 10+ 主流机型上**还不会自己起来**。
@@ -116,6 +119,20 @@ GitHub runner 是普通用户，冒烟测试会在"提权"这步全军覆没。
 `src/bossinit.c` 已经把两个入口铺好了，只差真实逻辑：
 
 ### 5.1 `boss init hijack-prep`（第一阶段，切根前执行）
+
+> ⚠️ **这一节只做了一半，别当成"已实现"。**
+> `src/bossinit.c` 的 `cmd_hijack_prep()` 现在**只铺了符号链接**，最关键的
+> `mount --bind <bossinit> /sdcard` 还躺在注释里——整个 `bossinit.c` 里
+> **没有任何 `mount()` 调用**。没有这一次 mount，切根后 `/system/bin/init`
+> 仍然是原厂 init，BOSS 根本不会被调起。
+>
+> 也就是说：**任务4 接好的早期注入（6.1 节那个 `selinux_setup` 分支）在 2SI 设备上
+> 一次都不会执行**，因为它依赖"我们被当成第二阶段 init 调起"这个前提。
+> 症状是"代码写完了、单测全绿、真机上一次不跑"——排查方向极易跑偏到
+> "我的挂载逻辑写错了"，实际是没人拉它起来。
+>
+> **这是接手后的第一件事**（优先级高于任何新功能）。详见本节末尾的「还差什么」。
+
 原理（与 Magisk 同源，利用 init 自己的 SwitchRoot）：
 
 ```
@@ -138,6 +155,38 @@ init 执行 SwitchRoot:
 - **用 2SI 但不切根的机型**（魅族等）→ 检查 ramdisk 里是否已有 `/sdcard`，有就走 hexpatch。
 - **三星 RKP** → 从 rootfs bind mount 自己（`/sdcard` → `/sdcard`），失败再退 `/data/...`。
 - **兜底**：`bossinit` 找不到真实 init 时**绝不 exec 自己**（会死循环变砖），直接放弃（`bossinit.c` 里已有这条保护，别删）。
+
+#### 5.1.1 还差什么（接手后的第一件事）
+
+缺的就是这一次 mount，以及它在**第一阶段**被调用的时机：
+
+```c
+/* src/bossinit.c: cmd_hijack_prep() 里的现状 —— 只有符号链接，没有 mount */
+/* 真正的 bind mount 由第一阶段的 bossinit 完成（见 docs）：
+ *   mount --bind <bossinit> /sdcard
+ * 这里只负责把符号链接铺好。 */
+```
+
+要补的是（按依赖顺序）：
+
+1. **一次 `mount()`**。直接调 `mount(2)`，别 fork `/system/bin/mount`——
+   第一阶段没有 toolbox，`mount` 命令根本不存在。签名：
+   `mount(src, "/sdcard", NULL, MS_BIND, NULL)`。
+2. **`hijack-prep` 被第一阶段调用的时机**。它现在没有任何 rc / 代码路径会触发，
+   需要一条 `on early-init`（或 post-fs-data 之前）的钩子，或由 payload 的
+   `init.boss.rc` 在 ramdisk 还活着的时候拉起。
+3. **`/init.real` 从哪来**。5.2 的 `execv("/init.real")` 假设真实 init 已被
+   备份到这个路径——**这一步同样没人做**，没有它 stage2 直接返回 127。
+   真机上真实 init 在切根后位于 `/system/bin/init`，而我们已经顶替了那个位置，
+   所以**备份必须在切根之前完成**。
+
+**只能真机验**：沙盒里 `mount` 需要特权，且没有 SwitchRoot 可观察。
+本地最多验到"命令拼对了"，验不到"切根后真的落到 `/system/bin/init`"。
+所以别指望写完就绿——带上 `boss_selinux=0` 的自救路径再上机（见 `docs/TASK4` 第 6.2 节）。
+
+**验它有没有成的最快方法**：切根后看 `/proc/1/cmdline` 或
+`ls -l /proc/1/exe`。是我们自己（boss）就说明劫持成功；是原厂 init 就没成。
+这比看日志快得多——日志在这个阶段可能一个字节都没有。
 
 ### 5.2 `boss init stage2`（被当成第二阶段 init 执行时）
 1. `boss_install()`：把自己复制到 `/data/adb/boss/boss`（持久分区，ramdisk 没了也在）

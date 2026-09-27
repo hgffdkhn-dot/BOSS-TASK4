@@ -378,7 +378,36 @@ env 在这里不可靠；`/proc/cmdline` 是 veritpath 的 `cmdline_append` 能�
 
 ## 7. 给后续任务的接口
 
-- **任务5（无修改系统逻辑）**：你能用的仍然是 resetprop + 挂载这两件。enforcing 下它们现在有策略覆盖了（第 4.2 节前两行）。如果某个玩法需要新权限，往 `policy/boss.rule` 加，跑 `make rules` 重新内联。
+### 7.1 先看这个：任务5 接手后会撞上的一堵墙
+
+> 这一节比下面所有接口都重要。不看它，你会浪费很多时间在错误的方向上。
+
+任务5 做的 systemless 跑在 **post-fs-data**。而 post-fs-data 由
+`payload/init.boss.rc` 触发——**那份 rc 只在 ramdisk 存活的布局上会被执行**
+（非 2SI、vendor_boot 布局）。Android 10+ 主流 2SI 设备第一阶段结束会
+SwitchRoot，ramdisk 连同那份 rc 一起消失。
+
+2SI 设备上拿回执行权靠的是 v0.2 的 init 接管（接力须知第 5 节），而它**只做了一半**：
+
+| 环节 | 状态 |
+|---|---|
+| `cmd_stage2`（被调起之后做什么） | ✅ 任务4 已接好（第 6 节） |
+| `cmd_hijack_prep` 的 bind mount（怎么被调起） | ❌ **没做** —— `bossinit.c` 里没有 `mount()` 调用 |
+| `/init.real` 备份（stage2 依赖它） | ❌ **没做** —— 没它 stage2 直接返回 127 |
+
+**所以你的处境会是**：代码写完、单测能过、真机上一次都不执行。
+
+排查方向极易跑偏到"我的挂载逻辑写错了"——不是。**实际是没人拉它起来。**
+最快的判定方法：切根后看 `ls -l /proc/1/exe`，是我们自己就说明劫持成功了，
+是原厂 init 就没成。这比翻日志快得多，那个阶段日志可能一个字节都没有。
+
+**建议把接力须知 5.1.1 作为第一件事**（优先级高于任何新功能）。它只能真机验：
+沙盒里 mount 需要特权，也没有 SwitchRoot 可观察。上机务必带上
+`boss_selinux=0` 的自救路径（第 6.2 节）。
+
+### 7.2 各任务接口
+
+- **任务5（无修改系统逻辑）**：你能用的仍然是 resetprop + 挂载这两件。enforcing 下它们现在有策略覆盖了（第 4.2 节前两行）。如果某个玩法需要新权限，往 `policy/boss.rule` 加，跑 `make rules` 重新内联。挂载相关的系统权限（`mount` / `mounton` / `remount`）在 255 条里已经给到 `boss` 域，见第 4.2 节。
 - **任务6（客户端）**：
   - CLI：`boss selinux <子命令>`，返回码统一（0/1/2/3）
   - 状态展示：`boss selinux status` 一行出 enforcing 状态、策略源、引擎、内嵌规则数、pending
@@ -433,7 +462,9 @@ env 在这里不可靠；`/proc/cmdline` 是 veritpath 的 `cmdline_append` 能�
 | 项 | 状态 | 说明 |
 |---|---|---|
 | 策略内容（255 条） | **未上真机** | 语法与模型对齐 Magisk，但每条在各机型上是否都存在没验过。靠 `permissive boss` 兜底 |
-| 早期注入链路 | **未上真机** | 命令与接口就绪，落点在 su 侧 v0.2（第 6 节） |
+| 早期注入链路（被调起之后） | **未上真机** | `cmd_stage2` 已接好（第 6 节），沙盒验到 6 项；真机验不到，因前提未成立 → 见下行 |
+| 早期注入的**前提**：SwitchRoot 劫持 | **没做** | `cmd_hijack_prep` 缺 bind mount、`/init.real` 没人备份。**2SI 设备上 BOSS 不会被调起，本任务所有早期逻辑一次都不执行**（第 7.1 节、接力须知 5.1.1） |
+| `/init.real` 的存在性 | **没做** | `cmd_stage2` 依赖真实 init 已备份到该路径；没有就返回 127（不 exec 自己，不变砖） |
 | libsepol 内置后端 | **已 vendor + 合成策略验过，未上真机** | 见 3.3：type 创建 / permissive 位 / attribute 展开 / 写回可解析都已端到端验过；但没吃过真机的 precompiled_sepolicy（各厂商 policy 版本与自定义 class 差异） |
 | `boss selinux load` | 视内核而定 | 部分内核/厂商锁死了 `/sys/fs/selinux/load`，写不了会明确报错并返回 1，不会静默 |
 | 8.0+ 收紧模型 | 默认关闭 | 第 10 组，需按机型补 app domain（第 4.3 节） |
