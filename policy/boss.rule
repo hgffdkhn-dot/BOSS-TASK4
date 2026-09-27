@@ -1,0 +1,427 @@
+# BOSS · 核心 SELinux 规则集（任务4 独占产出）
+#
+# 这份文件回答的是"BOSS 到底需要哪些权限"——任务3 只出工具（boss sepolicy），
+# 策略内容本来就该由任务4 定义（见 docs/SELINUX-REQUIREMENTS.md 与
+# docs/TASK3-组件交付与接力.md 第 4.1 节）。
+#
+# 语法完全对齐 Magisk 的 sepolicy.rule，因此：
+#   · 三号的 boss sepolicy 能直接解析（他的 op_of 认 allow/deny/type/
+#     typeattribute/permissive/type_transition/type_change/dontaudit/auditallow）
+#   · magiskpolicy / supolicy 这类现成引擎也能直接吃
+#
+# ---------------------------------------------------------------------------
+# 阅读前必须理解的三件事
+# ---------------------------------------------------------------------------
+# 1. 【尽力而为】Android 各版本的 type / class / perm 集合不一样（厂商还会增删）。
+#    引擎对"目标 type 不存在""class 不存在"这类错误必须**跳过并计数**，
+#    绝不能整份策略失败——一条规则缺失只会让某个功能没权限，
+#    整份失败会让 BOSS 起不来。本文件里每条都标了 [必需] / [尽力]。
+#
+# 2. 【permissive 是有意保留的】`permissive boss` 只作用于 BOSS 自己的域，
+#    不影响系统任何其他域。这是"日用优先"的折中：规则集要覆盖全部功能
+#    需要逐机型验证，而 permissive 让 BOSS 在任何机型上都能先跑起来。
+#    等真机上把 denied 日志收集完整、规则补齐后，再去掉 permissive 收紧。
+#    （Magisk 长期也是这么做的。）
+#
+# 3. 【分层】第 1~5 组是基座（少了 BOSS 就废），第 6~9 组是功能组，
+#    第 10 组是 8.0+ 收紧模型的可选项。收紧模型会让"哪些 app 能拿到 root"
+#    变成策略可见，但也会把兼容性面拉大——默认不启用，见第 10 组注释。
+#
+# 本文件由 tools/gen_rules_h.py 编进二进制（src/boss_rules.h）。
+# 原因：早期注入发生在 init 的 selinux_setup 阶段，那时 /data 还没挂载，
+# 读不到磁盘上的规则文件——策略内容必须内嵌。改完这里记得重新生成。
+# ---------------------------------------------------------------------------
+
+# ── 1. 类型声明 ────────────────────────────────────────────── [必需]
+#
+# boss         守护进程域。架构红线第 1 条：daemon 是唯一的特权实体。
+# boss_file    /data/adb/boss 下的数据文件。标成 mlstrustedobject 是让
+#              跨 MLS 级别的访问不被拦（root 进程常被要求这点）。
+# boss_exec    BOSS 二进制本体。带 exec_type 才能被 type_transition 用。
+# boss_client  su 客户端域（无特权），8.0+ 收紧模型才用得上。
+type boss domain
+type boss_file file_type data_file_type mlstrustedobject
+type boss_exec exec_type file_type data_file_type mlstrustedobject
+type boss_client domain
+
+# mlstrustedsubject：允许 boss 域读写高 MLS 级别的对象。
+# 少了这条，在开了 MLS 的机型上会出现"明明是 root 却 getattr 失败"。
+typeattribute boss mlstrustedsubject
+typeattribute boss_client mlstrustedsubject
+
+# 调试期保险（见开头第 2 条）。收集完 denied 日志后可去掉。
+permissive boss
+
+# ── 2. 对自身资源的完全访问 ────────────────────────────────── [必需]
+# /data/adb/boss 是 BOSS 的全部家当，自己访问自己不该被拦。
+allow boss boss_file file *
+allow boss boss_file dir *
+allow boss boss_file lnk_file *
+allow boss boss_file sock_file *
+allow boss boss_file fifo_file *
+allow boss boss_file filesystem mount
+allow boss boss_exec file *
+allow boss boss_exec dir *
+
+# ── 3. 属性系统（resetprop）────────────────────────────────── [必需]
+#
+# resetprop 的原理是 mmap /dev/__properties__ 下的区域文件直接改内存。
+# 三个要点：
+#   · Android 8.0+ 是**多区域**（按 property_contexts 前缀分片），
+#     所以给的是 type（properties_data_file）而不是单个路径；
+#   · mmap PROT_READ|PROT_WRITE 需要 read + write，MMAP 还需要 execute
+#     （bionic 对可写映射会要求 execute，这是 resetprop 最常见的 denied）；
+#   · persist 属性要落到 /data/property，持久化快照在 /data/adb/boss。
+allow boss properties_data_file file open
+allow boss properties_data_file file read
+allow boss properties_data_file file write
+allow boss properties_data_file file getattr
+allow boss properties_data_file file map
+allow boss properties_data_file file execute
+allow boss properties_data_file dir search
+allow boss properties_data_file dir read
+allow boss properties_data_file dir open
+allow boss properties_data_file dir getattr
+allow boss property_data_file file read
+allow boss property_data_file file write
+allow boss property_data_file file open
+allow boss property_data_file file getattr
+allow boss property_data_file file map
+allow boss property_data_file file execute
+# legacy 单区域（Android 7 及更早的 properties_data_file / property_data_file 之外）
+allow boss properties_serial file read
+allow boss properties_serial file open
+allow boss properties_serial file getattr
+
+# ── 4. 挂载（模块 Magic Mount）─────────────────────────────── [必需]
+#
+# Magic Mount 要做的事：tmpfs 挂到目标目录 + bind mount 模块文件 +
+# 从 /data/adb/boss/tmp/mirror 还原原文件。
+# mount 本身受 capability 与 filesystem:mount 双重约束，两个都得给。
+allow boss self capability sys_admin
+allow boss self capability dac_override
+allow boss self capability dac_read_search
+allow boss self capability chown
+allow boss self capability fowner
+allow boss self capability fsetid
+allow boss self capability setuid
+allow boss self capability setgid
+# 挂载点形态各异（labeledfs / tmpfs / 各分区的 fs），这里用通配 + 尽力而为
+allow boss labeledfs filesystem mount
+allow boss labeledfs filesystem remount
+allow boss labeledfs filesystem unmount
+allow boss tmpfs filesystem mount
+allow boss tmpfs filesystem remount
+allow boss rootfs filesystem mount
+allow boss rootfs filesystem remount
+# 模块要覆盖的分区：名字随机型差异很大，逐条尽力而为
+allow boss system_file dir mounton
+allow boss system_file file mounton
+allow boss system_file dir read
+allow boss system_file dir getattr
+allow boss system_file dir search
+allow boss system_file file read
+allow boss system_file file getattr
+allow boss vendor_file dir mounton
+allow boss vendor_file file mounton
+allow boss vendor_file dir read
+allow boss vendor_file dir getattr
+allow boss product_file dir mounton
+allow boss product_file file mounton
+allow boss system_ext_file dir mounton
+allow boss system_ext_file file mounton
+allow boss odm_file dir mounton
+allow boss odm_file file mounton
+
+# ── 5. 进程与执行 ──────────────────────────────────────────── [必需]
+#
+# daemon 要 fork 子进程、切 uid/gid、切 SELinux 域（setexeccon）、开 pty。
+allow boss self process fork
+allow boss self process execmem
+allow boss self process execstack
+allow boss self process setexec
+allow boss self process setcurrent
+allow boss self process setsched
+allow boss self process sigchld
+allow boss self process sigkill
+allow boss self process signal
+allow boss self process ptrace
+allow boss self process transition
+allow boss self process dyntransition
+allow boss self process getcap
+allow boss self process setcap
+allow boss self capability kill
+allow boss self capability net_admin
+allow boss self capability sys_module
+allow boss self capability sys_ptrace
+# 目标身份切换后的子进程跑在目标域里时，boss 要能给它 transition
+allow boss shell process transition
+allow boss shell process sigchld
+allow boss shell file read
+allow boss shell file execute
+allow boss shell file getattr
+allow boss shell file open
+allow boss shell file entrypoint
+allow boss devpts chr_file read
+allow boss devpts chr_file write
+allow boss devpts chr_file getattr
+allow boss devpts chr_file ioctl
+allow boss devpts chr_file open
+
+# ── 5b. init 拉起 BOSS ─────────────────────────────────────── [必需]
+#
+# init.boss.rc 里写的是 `exec_background u:r:boss:s0 root root -- /boss boot ...`。
+# 要让这个 seclabel 真正生效，init 必须有**切到 boss 域**的许可，
+# 否则要么整条命令被拒（BOSS 在 enforcing 下根本起不来），
+# 要么静默退化成 init 域（表现为"能起来但权限不对"）。
+# 这两条是这条链路的全部前提，缺一不可：
+#   ① init → boss 的 process transition
+#   ② init 对 boss_exec 文件的 execute
+allow init boss process transition
+allow init boss process dyntransition
+allow init boss process setcurrent
+allow init boss process sigchld
+allow init boss process signal
+allow init boss process rlimitinh
+allow init boss process siginh
+allow init boss process noatsecure
+allow init boss_exec file execute
+allow init boss_exec file execute_no_trans
+allow init boss_exec file read
+allow init boss_exec file open
+allow init boss_exec file getattr
+allow init boss_exec file map
+allow init boss_exec file entrypoint
+allow init boss fifo_file write
+allow init boss fd use
+# rc 里走 exec_background 时 init 会把输出接管走，需要双向管道
+allow boss init fifo_file read
+allow boss init fifo_file write
+allow boss init fd use
+allow boss init process sigchld
+# ueventd / init 的子域（各家命名不同，尽力而为）
+allow ueventd boss process transition
+allow ueventd boss_exec file execute
+
+# ── 6. IPC：抽象命名空间套接字 @bossd ──────────────────────── [必需]
+#
+# BOSS 用 AF_UNIX 抽象命名空间（sun_path[0]='\0'），文件系统里没有节点，
+# 所以没有 sock_file 需要 label——这也是"不在 /dev/socket 留痕迹"的原因。
+# 抽象 socket 的 type 就是创建它的进程的域（boss），
+# 因此客户端需要的是 connectto boss。
+allow boss self unix_stream_socket create
+allow boss self unix_stream_socket bind
+allow boss self unix_stream_socket listen
+allow boss self unix_stream_socket accept
+allow boss self unix_stream_socket read
+allow boss self unix_stream_socket write
+allow boss self unix_stream_socket getattr
+allow boss self unix_stream_socket setattr
+allow boss self unix_stream_socket getopt
+allow boss self unix_stream_socket setopt
+allow boss self unix_stream_socket shutdown
+allow boss self unix_stream_socket connectto
+allow boss self unix_stream_socket sendto
+allow boss self unix_stream_socket recvfrom
+allow boss self unix_dgram_socket create
+allow boss self unix_dgram_socket sendto
+allow boss self unix_dgram_socket write
+# SCM_RIGHTS 传 fd（协议握手就是传退出码通道）
+allow boss self fd use
+
+# ── 7. 策略注入自身 ────────────────────────────────────────── [必需]
+#
+# 任务4 自己要能读写策略：早期注入读 precompiled_sepolicy，
+# 运行时 live patch 写 /sys/fs/selinux/load。
+allow boss selinuxfs file read
+allow boss selinuxfs file write
+allow boss selinuxfs file open
+allow boss selinuxfs file getattr
+allow boss selinuxfs dir search
+allow boss selinuxfs dir read
+allow boss selinuxfs dir open
+# 部分内核把 load 节点标成 security_file / proc 下的 selinux 目录
+allow boss security_file file read
+allow boss security_file file write
+allow boss security_file file open
+allow boss proc file read
+allow boss proc file write
+allow boss proc file open
+# 读策略源文件（/system/etc/selinux/precompiled_sepolicy 等）
+allow boss system_file file read
+allow boss system_file file open
+allow boss system_file file getattr
+allow boss vendor_file file read
+allow boss vendor_file file open
+allow boss vendor_file file getattr
+allow boss system_conf_file file read
+allow boss system_conf_file file open
+allow boss system_conf_file file getattr
+# 执行注入引擎（外部引擎后端会 fork/exec magiskpolicy 等）
+allow boss boss_exec file execute_no_trans
+allow boss boss_exec file execute
+allow boss boss_exec file read
+allow boss boss_exec file open
+allow boss boss_exec file getattr
+allow boss boss_exec file map
+allow boss zygote_exec file execute
+allow boss zygote_exec file read
+allow boss zygote_exec file open
+allow boss zygote_exec file getattr
+
+# ── 8. 开机脚本执行器 ──────────────────────────────────────── [必需]
+#
+# boot 脚本要 fork/exec 用户脚本、写审计日志 /data/adb/boss/boss.log。
+# 脚本本身标成 boss_exec，跑在 boss 域（所以脚本天然有 boss 的权限）。
+allow boss boss_exec file execute_no_trans
+allow boss toolbox_exec file execute
+allow boss toolbox_exec file read
+allow boss toolbox_exec file open
+allow boss toolbox_exec file getattr
+allow boss toolbox_exec file execute_no_trans
+allow boss shell_exec file execute
+allow boss shell_exec file read
+allow boss shell_exec file open
+allow boss shell_exec file getattr
+allow boss shell_exec file execute_no_trans
+
+# ── 9. unrestricted file context ───────────────────────────── [必需]
+#
+# 让系统里所有域都能访问 BOSS 的文件（读模块内容、执行 applet 等）。
+# 这是 Magisk 的 magisk_file 模型：与其逐个 domain 加 allow，
+# 不如把 boss_file 声明成"谁都能碰"。
+# 用 domain 这个 attribute 通配——各版本 domain 集合不同，尽力而为。
+allow domain boss_file file read
+allow domain boss_file file write
+allow domain boss_file file open
+allow domain boss_file file getattr
+allow domain boss_file file execute
+allow domain boss_file file execute_no_trans
+allow domain boss_file file map
+allow domain boss_file dir search
+allow domain boss_file dir read
+allow domain boss_file dir open
+allow domain boss_file dir getattr
+allow domain boss_file lnk_file read
+allow domain boss_file sock_file read
+allow domain boss_file sock_file write
+
+# ── 10. Android 8.0+ 收紧模型 ──────────────────────────────── [可选]
+#
+# 这一组实现的是 docs/SELINUX-REQUIREMENTS.md 第 2 节的"8.0+ 收紧模型"：
+#   · 只允许 BOSS 自己给文件标 boss_exec；
+#   · su client 执行 boss_exec 时 type_transition 到 boss_client（无特权域）；
+#   · 禁止客户端直连 daemon socket，唯一入口是 boss_client 进程。
+#
+# 为什么默认不启用：它会把"哪些 app 能调 su"变成策略可见，
+# 兼容性面很大（各版本 app domain 名字不一样：untrusted_app /
+# untrusted_app_25 / untrusted_app_27 / untrusted_app_29 ... 还有
+# isolated_app / ephemeral_app / sdk_sandbox）。
+# 折中：**先只用 boss_client + type_transition 这两条（低风险）**，
+# 待真机验过再把各 app domain 的 connectto 补齐。
+#
+# 启用方式：把下面的行取消注释，并把 app domain 列表按机型补齐。
+#
+#type_transition untrusted_app boss_exec process boss_client
+#type_transition untrusted_app_25 boss_exec process boss_client
+#type_transition untrusted_app_27 boss_exec process boss_client
+#type_transition untrusted_app_29 boss_exec process boss_client
+#type_transition untrusted_app_30 boss_exec process boss_client
+#type_transition untrusted_app_32 boss_exec process boss_client
+#type_transition platform_app boss_exec process boss_client
+#type_transition priv_app boss_exec process boss_client
+#type_transition shell boss_exec process boss_client
+#
+#allow untrusted_app boss_exec file execute
+#allow untrusted_app boss_exec file read
+#allow untrusted_app boss_exec file open
+#allow untrusted_app boss_exec file getattr
+#allow untrusted_app boss_exec file map
+#allow untrusted_app boss_client process transition
+#allow boss_client boss unix_stream_socket connectto
+#allow boss_client boss unix_stream_socket read
+#allow boss_client boss unix_stream_socket write
+#allow boss_client boss unix_stream_socket getattr
+#allow boss_client boss unix_stream_socket getopt
+#allow boss_client boss unix_stream_socket setopt
+#allow boss_client boss unix_stream_socket shutdown
+#allow boss_client boss_client unix_stream_socket create
+#allow boss_client boss_client unix_stream_socket bind
+#allow boss_client boss_client unix_stream_socket connect
+#allow boss boss_client process transition
+#allow boss boss_client process sigchld
+#allow boss boss_client process signal
+#allow boss_client self process fork
+#allow boss_client self process execmem
+#allow boss_client boss_file file read
+#allow boss_client boss_file file getattr
+
+# ── 11. 兜底：显式放行常见拒绝点 ───────────────────────────── [尽力]
+#
+# 以下几条是 root 类工具在真机上最常被拒的几个点，单独列出来，
+# 避免每次都靠 permissive 兜。type 不存在就跳过（尽力而为）。
+allow boss apexd_data_file dir search
+allow boss apexd_data_file dir read
+allow boss dalvikcache_data_file dir search
+allow boss dalvikcache_data_file dir read
+allow boss app_data_file dir search
+allow boss app_data_file dir read
+allow boss app_data_file file read
+allow boss app_data_file file getattr
+allow boss privapp_data_file dir search
+allow boss privapp_data_file dir read
+allow boss system_app_data_file dir search
+allow boss system_app_data_file dir read
+allow boss mnt_media_rw_file dir search
+allow boss mnt_media_rw_file dir read
+allow boss sdcardfs dir search
+allow boss sdcardfs file read
+allow boss media_rw_data_file dir search
+allow boss media_rw_data_file file read
+allow boss apk_data_file dir search
+allow boss apk_data_file file read
+allow boss asec_apk_file dir search
+allow boss asec_apk_file file read
+allow boss debugfs dir search
+allow boss debugfs file read
+allow boss debugfs file write
+allow boss sysfs dir search
+allow boss sysfs file read
+allow boss sysfs file write
+allow boss sysfs file open
+allow boss proc_net dir search
+allow boss proc_net file read
+allow boss proc_security dir search
+allow boss proc_security file read
+allow boss proc_security file write
+allow boss selinuxfs file ioctl
+allow boss device dir read
+allow boss device dir search
+allow boss device file read
+allow boss device chr_file read
+allow boss device chr_file write
+allow boss kmsg_device chr_file write
+allow boss kmsg_device chr_file open
+allow boss block_device dir search
+allow boss block_device blk_file read
+allow boss block_device blk_file getattr
+allow boss misc_block_device blk_file read
+allow boss misc_block_device blk_file getattr
+allow boss dm_device blk_file read
+allow boss dm_device blk_file getattr
+
+# ── 12. 日志与审计 ─────────────────────────────────────────── [必需]
+# 审计日志写在 /data/adb/boss/boss.log（BOSS_DIR 下，已被第 2/9 组覆盖）。
+# 这里补的是"写系统日志"的能力（logcat / pstore），排查开机问题时很有用。
+allow boss logd unix_stream_socket connectto
+allow boss logd unix_stream_socket read
+allow boss logd unix_stream_socket write
+allow boss logd unix_stream_socket getattr
+allow boss logd unix_stream_socket getopt
+allow boss logd unix_stream_socket setopt
+allow boss logd unix_stream_socket shutdown
+allow boss logd_socket sock_file write
+allow boss logd_socket sock_file open
+allow boss logd_socket sock_file getattr
+allow boss pstorefs dir search
+allow boss pstorefs file read

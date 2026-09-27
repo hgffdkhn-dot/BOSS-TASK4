@@ -1,0 +1,42 @@
+# BOSS · file_contexts 补丁（任务4）
+#
+# 这份文件的用途有两个，两者都必须对上，否则会出现"标签打不上"或
+# "init 报 unknown type"：
+#
+#   A) ramdisk 阶段：veritpath 注入时会把这里匹配 /boss 的那一行写进
+#      ramdisk 的 /file_contexts（manifest 的 files[].context 字段）。
+#      → 所以 manifest.json 里的 "context" 要从 u:object_r:rootfs:s0
+#        改成 u:object_r:boss_exec:s0。
+#   B) /data 阶段：/data 挂载后，由 `boss selinux label` 递归给
+#      /data/adb/boss 打标签（用 setxattr 直接写 security.selinux，
+#      不依赖 libselinux——静态二进制里没有 dlopen，见接力须知 4.4）。
+#
+# ⚠️ 顺序红线：**type 必须先于 file_contexts 存在**。
+#    init 在 selinux_setup 阶段先加载策略、再做 restorecon。如果策略里
+#    还没有 boss_exec，而 file_contexts 已经引用它，init 打标签时会失败
+#    （unknown type），表现为 /boss 变成 u:object_r:rootfs 或直接报错。
+#    这就是为什么**策略注入必须赶在 init 加载策略之前**，
+#    而不能等到 post-fs-data 再做 live patch——见主方案文档第 2 节。
+#
+# 语法是标准 file_contexts（正则 + 类型），可直接追加到 plat_file_contexts
+# 之后，也可由 `boss selinux label` 独立使用。
+
+# ── ramdisk 本体（veritpath 注入的 /boss）────────────────────
+# 标成 boss_exec：它是要被执行的二进制，且允许 8.0+ 收紧模型做
+# type_transition（exec_type 才能当 transition 的 target）。
+/boss                       u:object_r:boss_exec:s0
+/veritpath/boss             u:object_r:boss_exec:s0
+
+# ── /data 下的家当 ───────────────────────────────────────────
+# 二进制本体与 applet symlink：boss_exec（要能被执行）
+/data/adb/boss/boss                 u:object_r:boss_exec:s0
+/data/adb/boss/bin(/.*)?            u:object_r:boss_exec:s0
+/data/adb/boss/modules(/.*)?/system(/.*)?   u:object_r:boss_file:s0
+
+# 其余一律 boss_file：unrestricted file context，所有域都能访问
+/data/adb/boss(/.*)?                u:object_r:boss_file:s0
+
+# ── 说明 ─────────────────────────────────────────────────────
+# 上面几行的顺序不能颠倒：file_contexts 是**首次匹配优先**（像 selabel
+# 的实现那样按序匹配），所以具体的（boss / bin/）必须排在通配
+# （/data/adb/boss(/.*)?）之前，否则具体条目永远轮不到。

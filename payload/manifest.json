@@ -1,0 +1,29 @@
+{
+  "name": "boss",
+  "version": "0.1.0",
+  "arch": ["arm64", "arm", "x86_64", "x86"],
+  "min_api": 26,
+  "selinux": "keep",
+  "cmdline_append": ["androidboot.boss=1"],
+  "files": [
+    {
+      "src": "boss",
+      "dest": "/boss",
+      "mode": "0755",
+      "context": "u:object_r:rootfs:s0",
+      "required": true
+    },
+    {
+      "src": "boss",
+      "dest": "/veritpath/boss",
+      "mode": "0755",
+      "context": "u:object_r:rootfs:s0",
+      "required": false
+    }
+  ],
+  "rc": {
+    "file": "/init.boss.rc",
+    "content_file": "init.boss.rc",
+    "import_into": ["/init.rc"]
+  }
+}

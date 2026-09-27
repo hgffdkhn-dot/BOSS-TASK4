@@ -1,0 +1,94 @@
+name: 组件验收（任务3）
+
+# 任务3（resetprop / 模块挂载 / boot 脚本 / sepolicy 工具 / 工具集）的深度验收。
+#
+# 与 ci.yml 的分工：
+#   ci.yml → smoke    端到端主链路：su 授权 + 任务3 主路径（每次提交必跑）
+#   本文件            任务3 的边界与语义细节（改动组件时必跑）
+#
+# 关键约束：GitHub runner 是**非 root**，而任务3 大多数组件在真机上需要 root。
+# 所以这里全部走"离线可验"的路径——合成属性区（tools/mkprop.py）+ dry run
+# （module plan）。确实需要 root 的检查，脚本会明确输出 SKIP 而不是静默通过，
+# 避免"CI 全绿但真机上根本没跑"的假象。
+#
+# 只使用 GitHub 官方 action。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  components:
+    name: 组件深度验收（离线）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 脚本内部会 make clean && make test：
+      # make test 不会覆盖已存在的 build/boss，跑着"另一个 BOSS_DIR 的二进制"
+      # 而不自知是踩过的坑，所以必须由脚本自己来保证是从干净状态构建的。
+      - name: 跑组件深度验收
+        run: bash tools/component_test.sh
+
+      # 组件测试失败时，八成是某个测试 fixture 没建对，或者属性区解析出了偏差。
+      # 把现场打出来，省得下一位在本地复现一遍。
+      - name: 失败诊断
+        if: failure()
+        run: |
+          echo "--- 运行身份（非 root 时部分检查会标 SKIP，属正常）---"
+          id
+          echo "--- BOSS 运行时目录 ---"
+          ls -l /tmp/boss-test 2>/dev/null || echo "(无)"
+          echo "--- 审计日志 ---"
+          cat /tmp/boss-test/boss.log 2>/dev/null || echo "(无)"
+          echo "--- 合成属性区 ---"
+          ls -l /tmp/boss-props 2>/dev/null || echo "(无)"
+          echo "--- 模块 fixture ---"
+          find /tmp/boss-test/modules -maxdepth 2 2>/dev/null || echo "(无)"
+          echo "--- 脚本 fixture ---"
+          ls -l /tmp/boss-test/service.d 2>/dev/null || echo "(无)"
+
+      - name: 上传日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: component-test-logs
+          path: /tmp/boss-test/boss.log
+          if-no-files-found: ignore
+
+  # 属性区是与 init 共享内存的二进制契约。结构尺寸不对不会崩溃，而是
+  # **静默读错值**——最坏的一类 bug。resetprop.c 里有编译期断言拦这个，
+  # 但断言本身也可能是摆设（写错条件、被优化掉）。
+  # 这个 job 用"负向测试"证明断言真的在工作：故意把结构改错，
+  # 如果还能编译通过，说明断言失效，必须失败。
+  layout-guard:
+    name: 属性区布局断言自检
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 正常情况下应当构建成功
+        run: |
+          make clean
+          make test
+
+      - name: 故意破坏结构，确认编译被拦住
+        run: |
+          cp src/resetprop.c /tmp/resetprop.c.bak
+          # 给 prop_info 塞一个多余字段 → sizeof 变成 100 → 断言触发
+          sed -i '0,/char value\[PROP_VALUE_MAX\];/s//char value[PROP_VALUE_MAX]; uint32_t pad;/' src/resetprop.c
+          if make clean && make test >/dev/null 2>&1; then
+            echo "ERROR: 布局断言没生效——结构被改坏却仍然编译通过"
+            cp /tmp/resetprop.c.bak src/resetprop.c
+            exit 1
+          fi
+          echo "OK: 断言确实拦住了结构变化"
+          cp /tmp/resetprop.c.bak src/resetprop.c
+
+      - name: 还原后必须能正常构建
+        run: |
+          make clean
+          make test
+          ./build/boss -V

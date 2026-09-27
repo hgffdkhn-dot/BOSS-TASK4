@@ -1,0 +1,38 @@
+# BOSS — 由 veritpath 注入 ramdisk，并 import 进 /init.rc
+#
+# 作用域说明：
+#   · 本文件只在「ramdisk 能活到第二阶段」的布局上会被引擎执行
+#     （非 2SI、vendor_boot 布局，以及 ramdisk 未被 SwitchRoot 丢弃的设备）。
+#   · Android 10+ 主流 2SI 设备第一阶段结束会 SwitchRoot（把 / 下的挂载
+#     递归移动到 /system 并 chroot），ramdisk 连同本文件一起消失，
+#     这类设备要靠 v0.2 的 init 接管（boss init stage2 / hijack-prep）拿回执行权。
+#   · 拿回执行权之后跑什么，是同一套：`boss boot <stage>`。
+#
+# 为什么只写一条命令而不是罗列一堆 exec_background：
+#   exec_background 之间是并发的，没有先后保证。而开机的顺序是硬要求——
+#   落盘 → 拉起守护 → 模块属性 → 模块规则 → 模块挂载 → 脚本，
+#   顺序错了会表现为"挂载没生效"或"脚本读到旧文件"这类极难排查的问题。
+#   顺序由 boss boot 内部固定，rc 只负责在正确的时机触发一次。
+
+on post-fs-data
+    # /data 已挂载：落盘 + 拉起 bossd + 模块属性/规则/挂载 + post-fs-data 脚本
+    # 这是阻塞阶段（约 40s 上限），内部所有属性改写都用 resetprop -n
+    exec_background u:r:init:s0 root root -- /boss boot post-fs-data
+
+on boot
+    # 兜底：自升级 / 冷启动异常后确保 bossd 在跑
+    exec_background u:r:init:s0 root root -- /boss init start
+    # late_start 之后的大多数脚本跑在这里（非阻塞）
+    exec_background u:r:init:s0 root root -- /boss boot service
+
+on property:sys.boot_completed=1
+    # 依赖系统服务就绪的操作
+    exec_background u:r:init:s0 root root -- /boss boot completed
+
+# 备选写法（需要 init 直接托管时用这个，配合 oneshot）：
+# service bossd /boss daemon
+#     class late_start
+#     user root
+#     group root
+#     seclabel u:r:init:s0
+#     oneshot

@@ -1,0 +1,129 @@
+name: Release
+
+# 打 tag 就出包：Android 四个 ABI + Linux 静态 + 可直接喂给 veritpath 的 payload。
+#   git tag v0.1.0 && git push origin v0.1.0
+# 发布用 runner 自带的 gh CLI，不依赖第三方 action。
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 要构建的 tag
+        required: true
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 准备 NDK
+        run: |
+          SDK=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}
+          if ! compgen -G "$SDK/ndk/*/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" > /dev/null; then
+            SM=$(ls "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1)
+            SM=${SM:-$(command -v sdkmanager)}
+            [ -n "$SM" ] && { yes | "$SM" --licenses >/dev/null 2>&1 || true
+              "$SM" --install "ndk;27.0.12077973" >/dev/null 2>&1 || true; }
+          fi
+          ls -d "$SDK"/ndk/* 2>/dev/null || true
+
+      - name: 构建并组装 payload
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME || '/usr/local/lib/android/sdk' }}
+        run: |
+          STRICT=1 MAKE_PAYLOAD=1 bash build/build-ndk.sh
+          cd build/payload && zip -qr ../../dist/boss-payload.zip . && cd ../..
+          ls -l dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boss-android
+          path: |
+            dist/boss-android-*
+            dist/boss-payload.zip
+          if-no-files-found: error
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 静态二进制（x86_64 / aarch64）
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+          mkdir -p dist
+          make static
+          cp build/boss-static dist/boss-linux-x86_64
+          aarch64-linux-gnu-gcc -O2 -std=c11 -Wall -Wextra -DBOSS_NO_DLOPEN \
+            -static-pie -Isrc src/*.c -o dist/boss-linux-aarch64
+
+      - name: 冒烟测试仍然要过
+        run: bash tools/smoke_test.sh
+
+      # 出包前把任务3 组件的边界语义也过一遍：
+      # 发布的是给用户刷机的二进制，静默读错属性这类问题必须挡在发布前。
+      - name: 组件深度验收也要过
+        run: bash tools/component_test.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boss-linux
+          path: dist/boss-linux-*
+          if-no-files-found: error
+
+  release:
+    needs: [android, linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # gh 必须在 git 仓库里运行：它靠 .git 推断目标仓库（owner/repo）。
+      # 这个 job 以前只下载 artifact、没有 checkout，于是 gh 直接
+      # "fatal: not a git repository" 失败。artifact 是别的 job 产出的，
+      # 但 gh 不关心产物从哪来，它只认工作目录里的 .git。
+      # fetch-depth: 0 是为了让 gh release create 在 tag 尚不存在时
+      # 能正确定位默认分支 HEAD。
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: 打包并算校验和
+        run: |
+          mkdir -p out
+          find artifacts -type f -exec cp {} out/ \;
+          cd out && sha256sum * > SHA256SUMS.txt && ls -l
+
+      - name: 自检（发布前把环境说清楚，失败了不用猜）
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          echo "TAG=$TAG"
+          echo "git repo: $(git rev-parse --show-toplevel 2>&1)"
+          echo "remote  : $(git remote get-url origin 2>&1)"
+          # 提前暴露问题：没有 token / 不在仓库里 / out 为空，
+          # 否则错误会推迟到 gh 那一步，信息更少。
+          [ -n "$TAG" ] || { echo "ERROR: TAG 为空"; exit 1; }
+          ls -l out | sed -n '1,20p'
+          [ -n "$(ls -A out)" ] || { echo "ERROR: out 是空的"; exit 1; }
+          gh --version | head -1
+          gh repo view --json nameWithOwner -q .nameWithOwner
+
+      - name: 发布
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" out/* --clobber
+          else
+            gh release create "$TAG" out/* --generate-notes
+          fi

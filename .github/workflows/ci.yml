@@ -1,0 +1,193 @@
+name: CI
+
+# 目标：任何一次提交都能回答三个问题——
+#   1. 逻辑还通不通？（smoke：28 组端到端检查，含任务3 主路径）
+#   2. 代码还干不干净？（多 -std + -Werror + clang）
+#   3. Android 产物还能不能上机？（NDK 交叉编译 + Bionic 加载校验）
+# 只使用 GitHub 官方 action，不引入会突然消失的第三方 action。
+#
+# 任务3 组件的**边界与语义细节**不在这里，见 .github/workflows/components.yml。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    name: 冒烟测试（Linux）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 构建 + 28 组端到端检查
+        run: bash tools/smoke_test.sh
+
+      # runner 默认是**普通用户**，而 daemon 曾经被误标成 needs_root，
+      # 导致这里 7 项全红。这个 job 的存在本身就是回归防线：
+      # 非 root 下必须能起 daemon（提权降级为自身），整条 su 链路才能验到。
+      - name: 确认运行身份（非 root 也要全过）
+        run: |
+          id
+          echo "uid=$(id -u)"
+
+      - name: 上传日志（失败时看这个）
+        if: failure()
+        run: cat /tmp/boss-test/boss.log 2>/dev/null || true
+
+  strict:
+    name: 严格编译（多 -std / -Werror）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # 修过一次的教训：源码里漏了 feature-test macro 或某个 #include，
+      # 在 -std=c11 下才暴露（PATH_MAX、strtok_r、memcpy 这类）。
+      # 所以每个标准都编译一遍，并且警告即错误。
+      - name: 逐个 C 标准编译，警告即错误
+        run: |
+          for std in c99 c11 c17 gnu99 gnu11 gnu17; do
+            echo "--- -std=$std"
+            cc -O2 -std=$std -Wall -Wextra -Werror \
+               -DBOSS_DIR='"/tmp/boss-test"' -Isrc src/*.c -ldl -o /tmp/boss-$std
+          done
+
+      - name: 不带任何 feature-test macro
+        run: cc -O2 -std=c11 -Wall -Wextra -Werror -Isrc src/*.c -ldl -o /tmp/boss-plain
+
+      - name: 静态构建（dlopen 不可用，SELinux 走 /proc/self/attr/exec）
+        run: |
+          make clean
+          make static
+          ./build/boss-static -V
+
+      - name: clang 复核（runner 自带，警告不阻断）
+        run: |
+          clang --version || echo "no clang, skipped"
+          clang -O2 -std=c11 -Wall -Wextra -DBOSS_DIR='"/tmp/boss-test"' \
+                -Isrc src/*.c -ldl -o /tmp/boss-clang || true
+
+  payload:
+    name: payload 端到端（veritpath 实际注入）
+    runs-on: ubuntu-latest
+    env:
+      # 上游注入器；换镜像改这个变量即可
+      VP_REPO: ${{ vars.VP_REPO || 'https://github.com/hgffdkhn-dot/veritpath.git' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 取出上游 veritpath 并编译
+        run: |
+          git clone --depth 1 "$VP_REPO" /tmp/veritpath
+          make -C /tmp/veritpath
+
+      - name: 本地构建 BOSS 并组装 payload
+        run: |
+          make test
+          rm -rf build/payload && cp -r payload build/payload
+          cp build/boss build/payload/boss
+
+      - name: payload-check
+        run: /tmp/veritpath/build/veritpath payload-check build/payload
+
+      # 用上游的合成镜像生成器造一个 init_boot.img，真的注入一次，
+      # 再解包确认文件与 rc 钩子都到位。这是唯一能提前发现
+      # "manifest 写错 / rc 没被 import / 文件没进主段" 的手段。
+      - name: 造合成镜像 → inject → verify → 解包确认
+        run: |
+          set -e
+          mkdir -p /tmp/img /tmp/out
+          python3 - <<'PY'
+          import sys; sys.path.insert(0, '/tmp/veritpath/tests')
+          import imgkit
+          rd = imgkit.basic_ramdisk()
+          img = imgkit.boot_v3v4(imgkit.KERNEL, rd, hv=4, cmdline=b'androidboot.hardware=bossci')
+          open('/tmp/img/init_boot.img','wb').write(img)
+          PY
+          VP=/tmp/veritpath/build/veritpath
+          $VP analyze --boot /tmp/img/init_boot.img --brief
+          $VP inject --init-boot /tmp/img/init_boot.img -p build/payload -o /tmp/out/ --permissive
+          $VP verify /tmp/out/init_boot.veritpath.img -p build/payload
+          $VP unpack /tmp/out/init_boot.veritpath.img -d /tmp/work >/dev/null
+          test -f /tmp/work/ramdisk/boss
+          test -f /tmp/work/ramdisk/init.boss.rc
+          grep -q 'import /init.boss.rc' /tmp/work/ramdisk/init.rc
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boss-payload
+          path: build/payload
+          if-no-files-found: error
+
+  android:
+    name: Android（NDK 交叉编译）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # runner 自带 Android SDK 但不一定有 NDK；先找，找不到就用自带
+      # sdkmanager 装。仍然没有就让 build-ndk.sh 以 STRICT=1 明确失败，
+      # 而不是交出一个空目录。
+      - name: 准备 NDK
+        run: |
+          SDK=${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}
+          echo "SDK=$SDK"
+          if compgen -G "$SDK/ndk/*/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" > /dev/null; then
+            echo "NDK 已存在"
+          else
+            SM=$(ls "$SDK"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | head -1)
+            SM=${SM:-$(command -v sdkmanager)}
+            if [ -n "$SM" ]; then
+              yes | "$SM" --licenses >/dev/null 2>&1 || true
+              "$SM" --install "ndk;27.0.12077973" >/dev/null 2>&1 \
+                || "$SM" --install "ndk;26.3.11579264" >/dev/null 2>&1 \
+                || echo "sdkmanager 安装失败"
+            else
+              echo "没有 sdkmanager"
+            fi
+          fi
+          ls -d "$SDK"/ndk/* 2>/dev/null || true
+
+      - name: 构建 4 个 ABI
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME || '/usr/local/lib/android/sdk' }}
+        run: STRICT=1 bash build/build-ndk.sh
+
+      # 静态二进制最常见的两种"编译通过但一上机就 abort"：
+      # 非 PIE（Android 5+ 拒绝）与 PT_TLS 对齐不足（Bionic 拒绝）。
+      # build-ndk.sh 里已经逐个候选链接 + patch + check 过一遍，这里再列结果。
+      - name: 打印 Bionic 加载校验结果
+        run: |
+          for f in dist/boss-android-*; do
+            python3 tools/elf_fix.py --check "$f"
+          done
+
+      # 这个 job 失败时，八成是"链接方式"而不是源码问题——
+      # 把候选与最终选择打出来，省得下一位从头查。
+      - name: 失败诊断
+        if: failure()
+        run: |
+          echo "--- 编译器 ---"
+          ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/ndk/* 2>/dev/null || echo "没找到 NDK"
+          echo "--- 逐个候选手工验证（看哪个能产出 ET_DYN）---"
+          CC=$(ls "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/ndk/*/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android*-clang 2>/dev/null | head -1)
+          if [ -n "$CC" ]; then
+            for flags in "-static-pie" "-static -fPIE -pie" "-fPIE -pie"; do
+              echo "  [$flags]"
+              # shellcheck disable=SC2086
+              "$CC" -O2 -std=c11 $flags -DBOSS_DIR='"/data/adb/boss"' -Isrc src/*.c -ldl -lm \
+                  -o /tmp/probe 2>/dev/null \
+                && python3 tools/elf_fix.py /tmp/probe >/dev/null 2>&1 \
+                && python3 tools/elf_fix.py --check /tmp/probe | grep -E 'e_type|PT_TLS' \
+                || echo "    链接失败"
+            done
+          else
+            echo "没有可探测的交叉编译器"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boss-android
+          path: dist/boss-android-*
+          if-no-files-found: error
