@@ -24,9 +24,9 @@ TEST_DIR=/tmp/boss-test
 
 echo "== 构建（运行时目录 $TEST_DIR）=="
 make test >/dev/null 2>&1 || { echo "构建失败"; exit 1; }
-BIN=./build/boss
+BIN=./build/boss-test
 
-stop_daemon() { pkill -x boss >/dev/null 2>&1; sleep 0.2; }
+stop_daemon() { pkill -x boss >/dev/null 2>&1; pkill -x boss-test >/dev/null 2>&1; sleep 0.2; }
 stop_daemon
 rm -rf "$TEST_DIR" 2>/dev/null
 # 清不掉就明说：残留的目录通常属于另一个用户（root 跑完再以普通用户跑），
@@ -94,7 +94,7 @@ check "交互式 shell 可执行命令" "$OUT" "1"
 
 echo "== 9. applet 分发：子命令与 symlink 两种调用等价 =="
 mkdir -p "$TEST_DIR/bin"
-ln -sf "$(pwd)/build/boss" "$TEST_DIR/bin/resetprop"
+ln -sf "$(pwd)/build/boss-test" "$TEST_DIR/bin/resetprop"
 A=$($BIN --list 2>/dev/null | grep -c 'resetprop')
 check "--list 含 resetprop" "$A" "1"
 A=$($BIN --list 2>/dev/null | grep -c '^  module')

@@ -146,6 +146,16 @@ init 执行 SwitchRoot:
 
 **注意 `cmd_stage2` 现在的 argv 转发逻辑**：它会把 `argv[2..]` 传给真实 init。2SI 下 init 会以 `second_stage` / `selinux_setup` 之类的参数调我们，转发时必须**原样保留**，丢参数会导致 init 走错阶段。
 
+> ⚠️ 上一段是 v0.2 未落地时的描述，**已被任务4 修正**（见 `docs/TASK4` 第 6.1 节）。
+> 真机 2SI 的写法是 init 直接 `exec /system/bin/init second_stage`，
+> 阶段参数在 `argv[1]` 而不是 `argv[2]`——按旧描述转发会把阶段参数整个丢掉，
+> 真实 init 收不到 `second_stage` 就跑 `FirstStageMain`，开机循环。
+> 现在两种调用约定都认，且一个阶段参数都没捞到时按 `second_stage` 兜底。
+>
+> 另外 `selinux_setup` 以前根本没进 `boss_init_main` 的分发，会落到"未知参数"
+> 分支原样转发——早期注入一次都不会执行。现在它会进 `cmd_stage2`，
+> 注入成功后传 `second_stage`，失败则退回 `selinux_setup`。
+
 ### 5.3 另一条备选路：`androidboot.init_rc`
 `ro.boot.init_rc`（来自 cmdline）可以整体改写 boot script，veritpath 的 `cmdline_append` 能写它。
 但路径必须活到第二阶段 → 只能指向 `/data` 下的文件 → 依赖 `/data` 解密后可用，且部分厂商校验 cmdline。**仅当劫持方案在某机型上失效时再考虑。**

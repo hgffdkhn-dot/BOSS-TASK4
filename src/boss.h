@@ -173,6 +173,23 @@ int  boss_install(void);                       /* bossinit.c：落盘 + policy�
 int  boss_resetprop_main(int argc, char **argv);   /* B1 属性改写 */
 int  boss_sepolicy_main(int argc, char **argv);    /* C1 sepolicy 工具 */
 int  boss_selinux_main(int argc, char **argv);     /* 任务4 SELinux 解决与规则注入 */
+/* ---- 任务4 · libsepol 内置后端 ----
+ * 引擎链第一级（src/sepol_backend.c）：不 fork、不落临时文件、不依赖设备上
+ * 恰好存在 magiskpolicy。早期注入（init selinux_setup）时 /data 还没挂载，
+ * 外部引擎那条退路往往根本不存在，所以这一级是路径 A 能否成立的前提。
+ *
+ * 返回 0 全部应用 / 1 失败 / 2 无引擎 / 3 部分应用；
+ * 返回 -1 = 本后端不可用（没 vendor libsepol），调用方应交给下一级。
+ * 0 与 3 都表示"这一级已经接手"，不能再往下走，否则规则会被应用两遍。
+ */
+struct inject_result {
+    int applied;   /* 确认应用成功 */
+    int skipped;   /* 目标 type/class 不存在等"可容忍"失败 */
+    int failed;    /* 真正的错误 */
+};
+int  sepol_builtin_apply(const char *in, const char *out, const char **rules,
+                         int n, int live, struct inject_result *res);
+
 /* 任务4 给 sepolicy 工具用的注入入口：
  * 返回 0 全部应用 / 2 无引擎（规则已进 pending，不是成功）/ 3 部分应用 / 1 失败。
  * in/out 为 NULL 且 live=1 时直接改内核当前策略。 */

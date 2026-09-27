@@ -27,7 +27,7 @@ WORK=/tmp/boss-selinux-test
 
 echo "== 构建 =="
 make test >/dev/null 2>&1 || { echo "构建失败"; exit 1; }
-BIN=./build/boss
+BIN=./build/boss-test
 
 rm -rf "$WORK" "$TEST_DIR" 2>/dev/null
 mkdir -p "$WORK" "$TEST_DIR"
@@ -75,9 +75,13 @@ echo
 echo "== 4. 无引擎时必须进 pending 并返回 2（不能假装成功）=="
 # 这是任务3 定下的契约，boot.c 的 apply_module_rules 依赖它：
 # 2 = 没做成但不该中断开机；0 会被误判成"规则已生效"。
+#
+# 注意：带内置 libsepol 的产物本身就是一个引擎，所以要先用 BOSS_SEPOL=0
+# 把它关掉，才能测到"真的没有引擎"这条路径——否则第 4 组永远测的是
+# 内置后端，而第 4 组要验的恰恰是内置后端也不可用时该怎么办。
 rm -f "$ENGINE" 2>/dev/null
 echo "fake" > "$WORK/in.policy"
-"$BIN" selinux patch "$WORK/in.policy" "$WORK/out.policy" >/dev/null 2>&1
+BOSS_SEPOL=0 "$BIN" selinux patch "$WORK/in.policy" "$WORK/out.policy" >/dev/null 2>&1
 check "patch 无引擎返回 2" "$?" "2"
 if [ -f "$TEST_DIR/sepolicy.pending" ]; then
     ok "规则已落 pending 队列"
@@ -86,7 +90,7 @@ else
     bad "pending 队列未生成"
 fi
 
-"$BIN" selinux pending >/dev/null 2>&1
+BOSS_SEPOL=0 "$BIN" selinux pending >/dev/null 2>&1
 check "pending 消费无引擎同样返回 2" "$?" "2"
 if [ -f "$TEST_DIR/sepolicy.pending" ]; then ok "消费失败不清队列（不丢规则）"; else bad "队列被误清"; fi
 

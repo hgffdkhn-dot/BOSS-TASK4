@@ -70,26 +70,8 @@
 #define RC_NO_ENGINE 2   /* 没有可用引擎，规则已进 pending（不是成功） */
 #define RC_PARTIAL   3   /* 部分应用：有规则被跳过或拒绝（尽力而为的正常结果） */
 
-struct inject_result {
-    int applied;   /* 确认应用成功 */
-    int skipped;   /* 目标 type/class 不存在等"可容忍"失败 */
-    int failed;    /* 真正的错误 */
-};
-
-/* ---- libsepol 内置后端（vendor 之后才有） ----
- * src/sepol_backend.c 由 tools/vendor-sepol.sh 拉取 libsepol 后编译。
- * 没有 vendor 时这里退化成"不支持"，引擎自动走外部引擎后端。 */
-#ifdef BOSS_HAVE_SEPOL
-int sepol_builtin_apply(const char *in, const char *out, const char **rules,
-                        int n, int live, struct inject_result *res);
-#else
-static int sepol_builtin_apply(const char *in, const char *out, const char **rules,
-                               int n, int live, struct inject_result *res)
-{
-    (void)in; (void)out; (void)rules; (void)n; (void)live; (void)res;
-    return -1;   /* 未编译进本二进制 */
-}
-#endif
+/* struct inject_result 与 sepol_builtin_apply() 的声明都在 boss.h：
+ * 实现在 src/sepol_backend.c（没 vendor libsepol 时它是个返回 -1 的桩）。 */
 
 /* ------------------------------------------------------------------ */
 /* 小工具                                                              */
@@ -288,9 +270,15 @@ static int inject_rules(const char *in, const char *out, int live,
 {
     memset(res, 0, sizeof(*res));
 
-    /* 1) 内置 libsepol 后端优先：不 fork、不写临时文件，快且准 */
-    if (sepol_builtin_apply(in, out, rules, n, live, res) == 0)
-        return RC_OK;
+    /* 1) 内置 libsepol 后端优先：不 fork、不写临时文件，快且准。
+     * 0（全应用）与 3（部分应用）都表示"这一级接手了"——尤其 3 不能再往下走，
+     * 否则外部引擎会把同一批规则再应用一遍（规则是幂等的，但统计会翻倍，
+     * 而且失败的那几条会被重复判定，日志里出现两次假失败）。
+     * 返回 -1 才是"本后端不可用"，交给下一级。 */
+    int brc = sepol_builtin_apply(in, out, rules, n, live, res);
+    if (brc == RC_OK || brc == RC_PARTIAL) return brc;
+    /* 没接手：清掉可能已经写进去的计数，让下一级从头统计 */
+    memset(res, 0, sizeof(*res));
 
     /* 2) 外部引擎 */
     const char *engine = find_engine();

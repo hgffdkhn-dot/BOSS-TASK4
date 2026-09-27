@@ -12,9 +12,18 @@ EXTRA_CFLAGS ?=
 SRCS := src/main.c src/util.c src/policy.c src/pty.c \
         src/daemon.c src/client.c src/bossinit.c \
         src/applet.c src/resetprop.c src/scripts.c src/module.c \
-        src/sepolicy.c src/sh.c src/boot.c src/selinux.c
+        src/sepolicy.c src/sh.c src/boot.c src/selinux.c src/sepol_backend.c
 OUT  := build/boss
 STATIC_OUT := build/boss-static
+# 内置 libsepol 的构建同样用独立产物名，理由与 STATIC_OUT 完全一样
+# （接力须知 4.6）：与 build/boss 共用一个名字的话，make 会因为"目标已是最新"
+# 而不重建，于是你以为在测 sepol 版，实际跑的是上一个目标的产物——
+# 而且症状只在日志路径、引擎类型这类地方诡异地对不上。
+# 同理，`make test` 也要独立产物名：它唯一的差别就是 BOSS_DIR 指向 /tmp，
+# 而 make 不知道 EXTRA_CFLAGS 变了——跑着"另一个 BOSS_DIR 的二进制"而不自知
+# 正是接力须知 4.6 记过的坑，症状只表现为日志/pending 写去了奇怪的路径。
+TEST_OUT   := build/boss-test
+SEPOL_OUT  := build/boss-sepol
 
 all: $(OUT)
 
@@ -24,7 +33,11 @@ $(OUT): $(SRCS) src/boss.h
 
 # 主机侧冒烟测试用：把 /data/adb/boss 换成临时目录
 test: EXTRA_CFLAGS += -DBOSS_DIR='"/tmp/boss-test"'
-test: $(OUT)
+test: $(TEST_OUT)
+
+$(TEST_OUT): $(SRCS) src/boss.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -o $@ $(SRCS) $(LDLIBS)
 
 # 全静态：静态二进制里 dlopen 不可用，关掉它，SELinux 改走 /proc/self/attr/exec。
 # 用独立产物名——和 build/boss 混用会让人跑着"另一个 BOSS_DIR 的二进制"而不自知。
@@ -48,13 +61,74 @@ android-arm64:
 	    -ldl -lm
 	@echo "产物: build/out/boss"
 
+# 交叉编译 + 内置 libsepol：真机上真正想要的就是这一份。
+# 没有内置后端时，早期注入（selinux_setup）只能靠"设备上恰好有 magiskpolicy"，
+# 而那个阶段 /data 还没挂载，等于没有——所以带 sepol 的产物才是路径 A 的本体。
+#
+# ⚠️ 体积：内置 libsepol 会让二进制变大（主机侧实测 +224KB）。
+#    ramdisk 体积是硬约束（接力须知 8.3），上真机前务必确认 boot/init_boot
+#    分区放得下；放不下就退回不带 sepol 的产物，功能不残，只是路径 A 不可靠。
+android-sepol:
+	@test -n "$(ANDROID_CC)" || (echo "用法: make android-sepol ANDROID_CC=<ndk-clang>"; exit 1)
+	@test -d $(SEPOL_DIR)/src || { echo "先跑: bash tools/vendor-sepol.sh"; exit 1; }
+	@mkdir -p build/out
+	$(ANDROID_CC) -O2 -Wall -Wextra -static-pie \
+	    $(SEPOL_CFLAGS) -DBOSS_DIR='"/data/adb/boss"' \
+	    -o build/out/boss-sepol $(SRCS) $(SEPOL_SRCS) -lm
+	@echo "产物: build/out/boss-sepol"
+	@echo "别忘了过一遍 elf_fix.py + --check（接力须知 4.5 的两个加载门槛）"
+
 # 任务4：把 policy/boss.rule 编进二进制（src/boss_rules.h）。
 # 早期注入时 /data 还没挂载，读不到磁盘上的规则文件，所以策略内容必须内嵌。
 # 改了 policy/boss.rule 就要跑这个；CI 的 strict job 会校验产物与源一致。
 rules:
 	python3 tools/gen_rules_h.py
 
-clean:
-	rm -rf build/boss build/boss-static build/out
+# 任务4 的引擎链第一级：内置 libsepol。
+# 前置：bash tools/vendor-sepol.sh（把 libsepol 拉到 external/libsepol）。
+#
+# 不加这个目标也能正常构建——此时 src/sepol_backend.c 是个返回 -1 的桩，
+# 引擎自动落到外部引擎（magiskpolicy / sepolicy-inject / supolicy）。
+# 只有需要"不依赖外部引擎"的早期注入时才需要它。
+SEPOL_DIR  := external/libsepol
+SEPOL_SRCS := $(wildcard $(SEPOL_DIR)/src/*.c)
 
-.PHONY: all test android-arm64 rules clean
+# libsepol 是 AOSP 第三方源码，警告水平跟我们的代码不是一个量级，
+# 单独降噪，别让它淹没 BOSS 自身的警告。
+# -I.../src 不能省：libsepol 的 private.h 用尖括号 #include <dso.h>，
+# 尖括号不会回退到当前文件目录，少了这一项就是满屏 "dso.h: No such file"。
+# -std=gnu11 也不能省：libsepol 内部用了 typeof 这个 GNU 扩展，
+# 在严格 -std=c11 下它不会被识别，最后变成 "undefined reference to `typeof'"。
+SEPOL_CFLAGS := -I$(SEPOL_DIR)/include -I$(SEPOL_DIR)/src -DBOSS_HAVE_SEPOL \
+                -std=gnu11 \
+                -Wno-sign-compare -Wno-unused-function -Wno-unused-variable \
+                -Wno-strict-prototypes -Wno-pointer-sign -Wno-maybe-uninitialized
+
+sepol: EXTRA_CFLAGS += $(SEPOL_CFLAGS)
+sepol: SRCS += $(SEPOL_SRCS)
+sepol: LDLIBS =
+sepol: $(SEPOL_OUT)
+	@echo "产物: $(SEPOL_OUT)（已内置 libsepol 后端，engine 显示为 libsepol）"
+
+$(SEPOL_OUT): $(SRCS) src/boss.h
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -o $@ $(SRCS) $(LDLIBS)
+
+# 测试专用小工具：造一个能被 policydb_read 读回的最小 kernel policy。
+# 沙盒/CI 上没有真机的 precompiled_sepolicy，也没有 checkpolicy 能现编一个，
+# 所以内置后端要端到端地验，只能自己搭。不进主构建。
+sepolkit:
+	@test -d $(SEPOL_DIR)/src || { echo "先跑: bash tools/vendor-sepol.sh"; exit 1; }
+	@mkdir -p build
+	$(CC) -std=gnu11 -O1 -w -I$(SEPOL_DIR)/include -I$(SEPOL_DIR)/src \
+	    -o build/sepolkit tests/sepolkit.c $(SEPOL_SRCS)
+
+# 只验 libsepol 后端本身能不能编过（CI 上最快的一道闸）
+sepol-check: EXTRA_CFLAGS += $(SEPOL_CFLAGS)
+sepol-check: SRCS += $(SEPOL_SRCS)
+sepol-check: $(SEPOL_OUT)
+
+clean:
+	rm -rf build/boss build/boss-static build/boss-sepol build/boss-test build/sepolkit build/out
+
+.PHONY: all test android-arm64 android-sepol rules sepol sepol-check sepolkit clean
