@@ -27,7 +27,7 @@ WORK=/tmp/boss-selinux-test
 
 echo "== 构建 =="
 make test >/dev/null 2>&1 || { echo "构建失败"; exit 1; }
-BIN=./build/boss-test
+BIN=./build/boss
 
 rm -rf "$WORK" "$TEST_DIR" 2>/dev/null
 mkdir -p "$WORK" "$TEST_DIR"

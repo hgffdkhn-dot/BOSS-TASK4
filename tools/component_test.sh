@@ -26,11 +26,11 @@ UID_NOW=$(id -u)
 ROOT=$([ "$UID_NOW" -eq 0 ] && echo 1 || echo 0)
 TEST_DIR=/tmp/boss-test
 
-# make test 不会覆盖已存在的 build/boss——跑着"另一个 BOSS_DIR 的二进制"
-# 而不自知是踩过的坑，所以先 clean。
+# make test 的产物名就是 build/boss（CI 按这个名字取件），所以它现在会无条件
+# 重新链接、不会再留下上一份；先 clean 只为清掉 payload 之类其它残留。
 make clean >/dev/null 2>&1
 make test >/dev/null 2>&1 || { echo "构建失败"; exit 1; }
-BIN=$PWD/build/boss-test
+BIN=$PWD/build/boss
 
 # 清不掉就明说：残留目录通常属于另一个用户（root 跑完再以普通用户跑），
 # 后面每一项都会"莫名其妙地失败"，而不是在这里就报错。
@@ -267,7 +267,7 @@ check "daemon 不标 [root]" "$N" "0"
 $BIN daemon >/dev/null 2>&1
 for i in $(seq 1 24); do $BIN ping >/dev/null 2>&1 && break; sleep 0.25; done
 check "daemon 在当前身份下能起来" "$($BIN ping >/dev/null 2>&1; echo $?)" "0"
-pkill -x boss 2>/dev/null; pkill -x boss-test 2>/dev/null; sleep 0.2
+pkill -x boss 2>/dev/null; sleep 0.2
 
 echo
 echo "结果：PASS=$PASS FAIL=$FAIL SKIP=$SKIP"

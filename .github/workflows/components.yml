@@ -26,9 +26,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 脚本内部会 make clean && make test：
-      # make test 不会覆盖已存在的 build/boss，跑着"另一个 BOSS_DIR 的二进制"
-      # 而不自知是踩过的坑，所以必须由脚本自己来保证是从干净状态构建的。
+      # 脚本内部会 make clean && make test。
+      # make test 的产物名就是 build/boss（CI 按这个名字取件），且它现在会
+      # 无条件重新链接，不会再留下上一份 BOSS_DIR 不同的二进制。
       - name: 跑组件深度验收
         run: bash tools/component_test.sh
 

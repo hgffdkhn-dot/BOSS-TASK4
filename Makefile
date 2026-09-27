@@ -15,14 +15,9 @@ SRCS := src/main.c src/util.c src/policy.c src/pty.c \
         src/sepolicy.c src/sh.c src/boot.c src/selinux.c src/sepol_backend.c
 OUT  := build/boss
 STATIC_OUT := build/boss-static
-# 内置 libsepol 的构建同样用独立产物名，理由与 STATIC_OUT 完全一样
-# （接力须知 4.6）：与 build/boss 共用一个名字的话，make 会因为"目标已是最新"
-# 而不重建，于是你以为在测 sepol 版，实际跑的是上一个目标的产物——
-# 而且症状只在日志路径、引擎类型这类地方诡异地对不上。
-# 同理，`make test` 也要独立产物名：它唯一的差别就是 BOSS_DIR 指向 /tmp，
-# 而 make 不知道 EXTRA_CFLAGS 变了——跑着"另一个 BOSS_DIR 的二进制"而不自知
-# 正是接力须知 4.6 记过的坑，症状只表现为日志/pending 写去了奇怪的路径。
-TEST_OUT   := build/boss-test
+# 内置 libsepol 用独立产物名：它是**另一个**二进制（多带一份 libsepol）。
+# 与 build/boss 共用一个名字的话，跑着"上一个目标留下的产物"而不自知
+# （接力须知 4.6），症状只在日志路径、引擎类型这类地方诡异地对不上。
 SEPOL_OUT  := build/boss-sepol
 
 all: $(OUT)
@@ -31,13 +26,20 @@ $(OUT): $(SRCS) src/boss.h
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -o $@ $(SRCS) $(LDLIBS)
 
-# 主机侧冒烟测试用：把 /data/adb/boss 换成临时目录
+# 主机侧冒烟测试用：把 /data/adb/boss 换成临时目录。
+#
+# ⚠️ 必须**无条件重新链接**，不能写成 `test: $(OUT)` 那种带依赖的形式。
+# make 看不出 target-specific 的 EXTRA_CFLAGS 变了：只要 build/boss 存在且比源码新，
+# 它就一句"已是最新"跳过——于是你跑着上一次 `make` 留下的、BOSS_DIR 指向
+# /data/adb/boss 的二进制，症状是日志和 pending 写去了奇怪的路径，极难联想。
+# 代价只是每次多一次链接，换来"产物一定对得上当前目标"。
+#
+# 产物名保持 build/boss：CI 的 payload job 与 components.yml 都按这个名字取件，
+# 改名的代价是 CI 直接红。
 test: EXTRA_CFLAGS += -DBOSS_DIR='"/tmp/boss-test"'
-test: $(TEST_OUT)
-
-$(TEST_OUT): $(SRCS) src/boss.h
+test:
 	@mkdir -p build
-	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -o $@ $(SRCS) $(LDLIBS)
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -o $(OUT) $(SRCS) $(LDLIBS)
 
 # 全静态：静态二进制里 dlopen 不可用，关掉它，SELinux 改走 /proc/self/attr/exec。
 # 用独立产物名——和 build/boss 混用会让人跑着"另一个 BOSS_DIR 的二进制"而不自知。
@@ -104,15 +106,16 @@ SEPOL_CFLAGS := -I$(SEPOL_DIR)/include -I$(SEPOL_DIR)/src -DBOSS_HAVE_SEPOL \
                 -Wno-sign-compare -Wno-unused-function -Wno-unused-variable \
                 -Wno-strict-prototypes -Wno-pointer-sign -Wno-maybe-uninitialized
 
+# 同 `make test`：无条件重新链接，避免 build/boss-sepol 已存在时
+# make 一句"已是最新"把上一份产物留给你。
 sepol: EXTRA_CFLAGS += $(SEPOL_CFLAGS)
 sepol: SRCS += $(SEPOL_SRCS)
 sepol: LDLIBS =
-sepol: $(SEPOL_OUT)
-	@echo "产物: $(SEPOL_OUT)（已内置 libsepol 后端，engine 显示为 libsepol）"
-
-$(SEPOL_OUT): $(SRCS) src/boss.h
+sepol:
+	@test -d $(SEPOL_DIR)/src || { echo "先跑: bash tools/vendor-sepol.sh"; exit 1; }
 	@mkdir -p build
-	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -o $@ $(SRCS) $(LDLIBS)
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -o $(SEPOL_OUT) $(SRCS) $(LDLIBS)
+	@echo "产物: $(SEPOL_OUT)（已内置 libsepol 后端，engine 显示为 libsepol）"
 
 # 测试专用小工具：造一个能被 policydb_read 读回的最小 kernel policy。
 # 沙盒/CI 上没有真机的 precompiled_sepolicy，也没有 checkpolicy 能现编一个，
@@ -126,9 +129,12 @@ sepolkit:
 # 只验 libsepol 后端本身能不能编过（CI 上最快的一道闸）
 sepol-check: EXTRA_CFLAGS += $(SEPOL_CFLAGS)
 sepol-check: SRCS += $(SEPOL_SRCS)
-sepol-check: $(SEPOL_OUT)
+sepol-check:
+	@test -d $(SEPOL_DIR)/src || { echo "先跑: bash tools/vendor-sepol.sh"; exit 1; }
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) -o $(SEPOL_OUT) $(SRCS) $(LDLIBS)
 
 clean:
-	rm -rf build/boss build/boss-static build/boss-sepol build/boss-test build/sepolkit build/out
+	rm -rf build/boss build/boss-static build/boss-sepol build/sepolkit build/out
 
 .PHONY: all test android-arm64 android-sepol rules sepol sepol-check sepolkit clean

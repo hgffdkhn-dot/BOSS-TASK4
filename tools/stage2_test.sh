@@ -22,7 +22,7 @@ ok()   { echo "  [PASS] $1"; PASS=$((PASS+1)); }
 bad()  { echo "  [FAIL] $1"; FAIL=$((FAIL+1)); }
 skip() { echo "  [SKIP] $1"; SKIP=$((SKIP+1)); }
 
-BIN=$PWD/build/boss-test
+BIN=$PWD/build/boss
 WORK=/tmp/boss-stage2-test
 ARGS=$WORK/init-args.txt
 

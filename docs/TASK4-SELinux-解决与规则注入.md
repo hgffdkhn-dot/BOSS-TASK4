@@ -162,11 +162,21 @@ bash tools/sepol_backend_test.sh
 | 目标 | 产物 |
 |---|---|
 | `make` | `build/boss` |
-| `make test` | `build/boss-test`（BOSS_DIR 指向 /tmp） |
+| `make test` | `build/boss`（BOSS_DIR 指向 /tmp） |
 | `make sepol` | `build/boss-sepol` |
 | `make static` | `build/boss-static` |
 
-**改产物名时记得同步脚本里的 `pkill -x <名字>`**，否则残留 daemon 会占住抽象套接字，
+**`make test` / `make sepol` 必须无条件重新链接，不能写成带依赖的形式。**
+make 看不出 target-specific 的 `EXTRA_CFLAGS` 变了——只要产物存在且比源码新就一句
+"已是最新"跳过，于是你跑着上一份 BOSS_DIR 完全不同的二进制，症状是日志和 pending
+写去了奇怪的路径，极难联想回"产物是旧的"。代价只是每次多一次链接。
+
+**`make test` 的产物名不能改。** CI 的 payload job（`cp build/boss build/payload/boss`）
+和 components.yml（`./build/boss -V`）都按这个名字取件——改名 CI 直接红。
+（踩过：`test` 一度改成 `build/boss-test`，components.yml 第三步 `./build/boss -V`
+当场 `No such file or directory`。）
+
+产物名变了的话记得同步脚本里的 `pkill -x <名字>`，否则残留 daemon 会占住抽象套接字，
 下一次跑就是 `listen failed: Address already in use`（表现为日志项莫名失败）。
 
 #### 3.3.5 体积代价（真机上线前必须确认）
